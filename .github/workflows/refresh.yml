@@ -1,0 +1,93 @@
+name: Refresh dashboard
+
+on:
+  schedule:
+    # UTC has no DST, but Europe/Brussels does, so we fire at both candidate
+    # UTC hours and let the "gate" step below only proceed at true 09:00 local.
+    - cron: "0 7 * * *"   # 09:00 Europe/Brussels during CEST (summer)
+    - cron: "0 8 * * *"   # 09:00 Europe/Brussels during CET (winter)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-dashboard
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on 09:00 Europe/Brussels (skip the redundant cron fire)
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          hour=$(TZ=Europe/Brussels date +%H)
+          if [ "$hour" = "09" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping — it's $hour:00 in Europe/Brussels, not 09:00."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: success() && steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: success() && steps.gate.outputs.run == 'true'
+        run: pip install requests
+
+      - name: Seed tokens.json from stored refresh token
+        if: success() && steps.gate.outputs.run == 'true'
+        env:
+          C2_REFRESH_TOKEN: ${{ secrets.C2_REFRESH_TOKEN }}
+        run: |
+          python3 -c "
+          import json, os
+          json.dump(
+              {'access_token': '', 'refresh_token': os.environ['C2_REFRESH_TOKEN']},
+              open('tokens.json', 'w'),
+          )
+          "
+
+      - name: Fetch latest workouts
+        if: success() && steps.gate.outputs.run == 'true'
+        env:
+          C2_CLIENT_ID: ${{ secrets.C2_CLIENT_ID }}
+          C2_CLIENT_SECRET: ${{ secrets.C2_CLIENT_SECRET }}
+        run: python3 fetch_workouts.py
+
+      - name: Rebuild dashboard
+        if: success() && steps.gate.outputs.run == 'true'
+        run: python3 build_dashboard.py
+
+      - name: Rotate stored refresh token
+        if: success() && steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          new_refresh=$(python3 -c "import json; print(json.load(open('tokens.json'))['refresh_token'])")
+          gh secret set C2_REFRESH_TOKEN --repo "$GITHUB_REPOSITORY" --body "$new_refresh"
+
+      - name: Commit and push updated dashboard
+        if: success() && steps.gate.outputs.run == 'true'
+        run: |
+          rm -f tokens.json
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dashboard.html workouts.json strokes.json profile.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Automated daily refresh"
+            git push
+          fi
